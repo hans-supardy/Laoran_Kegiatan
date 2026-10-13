@@ -1,186 +1,364 @@
-<!DOCTYPE html>
-<html lang="id">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Generator Laporan Kegiatan</title>
-    <style>
-        /* Gaya Tampilan Aplikasi */
-        body {
-            font-family: Arial, sans-serif;
-            margin: 20px;
-            background-color: #f4f7f6;
-            color: #333;
-        }
-        .container {
-            max-width: 700px;
-            background: white;
-            padding: 25px;
-            border-radius: 8px;
-            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
-            margin: 0 auto;
-        }
-        h2 {
-            text-align: center;
-            color: #2c3e50;
-        }
-        .form-group {
-            margin-bottom: 15px;
-        }
-        label {
-            display: block;
-            font-weight: bold;
-            margin-bottom: 5px;
-        }
-        input[type="text"], input[type="date"], input[type="file"] {
-            width: 100%;
-            padding: 10px;
-            box-sizing: border-box;
-            border: 1px solid #ccc;
-            border-radius: 4px;
-        }
-        button {
-            background-color: #27ae60;
-            color: white;
-            border: none;
-            padding: 12px 20px;
-            font-size: 16px;
-            border-radius: 4px;
-            cursor: pointer;
-            width: 100%;
-            margin-top: 10px;
-        }
-        button:hover {
-            background-color: #219653;
-        }
+"""
+NAMA FILE: 2_jalan_otomatis_v5.py
+VERSI: 5.0 (v5.0) - FIXED NIK ANGGOTA
+PERBAIKAN: 
+1. Penataan ulang alur clipboard dan atribut elemen utama agar No KK TIDAK terisi NIK Pengurus.
+2. Logika pencarian dinamis untuk NIK Anggota agar teridentifikasi secara tepat dan terpisah dari Nama/Komponen.
+3. Fitur Autosave tiap kelipatan 5 KPM dipertahankan untuk keamanan data.
+4. Perbaikan _is_valid_nik agar mendukung pembacaan NIK Anggota bersensor (huruf X/*).
+"""
 
-        /* Gaya Template Laporan (Area Cetak) */
-        #report-template {
-            display: none; /* Sembunyikan di layar utama */
-            padding: 30px;
-            border: 2px solid #333;
-            background: white;
-        }
-        .report-header {
-            text-align: center;
-            border-bottom: 3px double #333;
-            padding-bottom: 10px;
-            margin-bottom: 20px;
-        }
-        .report-details td {
-            padding: 8px;
-            vertical-align: top;
-        }
-        .photo-preview {
-            max-width: 100%;
-            max-height: 400px;
-            margin-top: 15px;
-            border: 1px solid #ddd;
-            display: block;
-        }
+import pandas as pd
+from playwright.sync_api import sync_playwright
+import os
+import sys
+import time
 
-        /* Pengaturan Cetak (Mengubah tampilan saat di-print/PDF) */
-        @media print {
-            body * {
-                visibility: hidden;
-            }
-            #report-template, #report-template * {
-                visibility: visible;
-            }
-            #report-template {
-                position: absolute;
-                left: 0;
-                top: 0;
-                width: 100%;
-                display: block;
-            }
-        }
-    </style>
-</head>
-<body>
+if sys.platform == "win32":
+    import msvcrt
+    def flush_input():
+        while msvcrt.kbhit():
+            msvcrt.getch()
+else:
+    def flush_input():
+        pass
 
-<div class="container" id="input-form-container">
-    <h2>Form Laporan Kegiatan</h2>
-    <hr>
+# --- KONFIGURASI ---
+nama_file = "data_siks.xlsx"
+kolom_baru = [
+    'NIK_Pengurus',
+    'No_KK_KPM',
+    'Nama_Pengurus',
+    'NIK_Anggota',
+    'Nama_Anggota',
+    'Kategori_Komponen',
+    'Status',
+]
+list_data_final = []
+kpm_terproses_count = 0 
+
+if not os.path.exists("cookie_siks.json"):
+    print("[ERROR] cookie_siks.json tidak ditemukan!")
+    sys.exit()
+
+
+def set_rows_per_page_50(page):
+    try:
+        print("[INFO] Mencoba mengubah tampilan menjadi 50 baris...")
+        rows_control = page.locator(
+            ".MuiTablePagination-select, "
+            "[role='button'][aria-label*='rows per page' i], "
+            "[role='combobox'][aria-label*='rows per page' i], "
+            "select"
+        ).first
+
+        if rows_control.count() == 0:
+            print("[WARN] Kontrol 'Rows per page' tidak ditemukan.")
+            return
+
+        rows_control.scroll_into_view_if_needed(timeout=3000)
+        rows_control.click(force=True)
+        page.wait_for_timeout(1000)
+
+        option_50 = page.locator("[role='option']").filter(has_text="50").first
+        if option_50.count() == 0:
+            option_50 = page.locator(".MuiMenuItem-root, .MuiButtonBase-root").filter(has_text="50").first
+
+        if option_50.count() > 0:
+            option_50.click(force=True)
+            print("[INFO] Berhasil set ke 50 baris per halaman.")
+            page.wait_for_load_state("networkidle")
+            page.wait_for_timeout(2500)
+    except Exception as e:
+        print(f"[WARN] Gagal set rows per page: {e}")
+
+
+def simpan_ke_excel(data_list, filename, columns):
+    try:
+        if data_list:
+            pd.DataFrame(data_list, columns=columns).to_excel(filename, index=False)
+            print(f" -> [AUTOSAVE v5.0] Berhasil mencadangkan {len(data_list)} baris data ke {filename}")
+    except Exception as e:
+        print(f" -> [ERROR AUTOSAVE] Gagal: {e}")
+
+
+def ambil_data_asli_cell(page, cell_element):
+    """Mengambil data asli dengan mengklik tombol copy spesifik dan membaca clipboard browser."""
+    try:
+        # Tombol copy di modal NIK anggota (dari HTML kamu): aria-label="Salin NIK"
+        tombol_copy = None
+        try:
+            tombol_copy = cell_element.locator("button[aria-label='Salin NIK']").first
+            if tombol_copy.count() == 0:
+                tombol_copy = cell_element.locator("button[data-testid='ContentCopyIcon'], button:has([data-testid*='ContentCopyIcon'])").first
+        except Exception:
+            tombol_copy = None
+
+        if tombol_copy is None or tombol_copy.count() == 0:
+            tombol_copy = cell_element.locator("button, [role='button'], .MuiIconButton-root").first
+
+        if tombol_copy.count() > 0:
+            # Cek dulu jika teks asli ada di atribut elemen
+            for attr in ["data-text", "value", "title", "aria-label"]:
+                val = tombol_copy.get_attribute(attr)
+                if val and val.isdigit() and len(val) >= 15 and "****" not in val:
+                    return val.strip()
+
+            # Paksa kosongkan clipboard browser sebelum tombol disalin
+            page.evaluate("navigator.clipboard.writeText('')")
+            page.wait_for_timeout(150)
+
+            # Pastikan clipboard terisi (clipboard update bisa asynchronous)
+            prev = None
+            try:
+                prev = page.evaluate("navigator.clipboard.readText()")
+            except Exception:
+                prev = None
+
+            tombol_copy.click(force=True)
+
+            # Polling sampai isi clipboard berubah dan valid (maks 2.5 detik)
+            teks_asli = ""
+            start = time.time()
+            while time.time() - start < 2.5:
+                try:
+                    teks_asli = page.evaluate("navigator.clipboard.readText()")
+                except Exception:
+                    teks_asli = ""
+                if teks_asli and str(teks_asli).strip() and "****" not in str(teks_asli):
+                    return str(teks_asli).strip()
+                page.wait_for_timeout(150)
+
+            # Jika tetap gagal, fallback
+            if teks_asli and str(teks_asli).strip() and "****" not in str(teks_asli):
+                return str(teks_asli).strip()
+
+
+        return cell_element.inner_text().strip()
+    except Exception:
+        return cell_element.inner_text().strip()
+
+
+
+def run():
+    global kpm_terproses_count, list_data_final
     
-    <div class="form-group">
-        <label for="tanggal">Tanggal Kegiatan:</label>
-        <input type="date" id="tanggal" required>
-    </div>
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=False)
+        context = browser.new_context(
+            storage_state="cookie_siks.json",
+            permissions=["clipboard-read", "clipboard-write"]
+        )
+        page = context.new_page()
+        page.goto("https://siks.kemensos.go.id/pkh/bnba-pendamping-verifikasi-komitmen")
 
-    <div class="form-group">
-        <label for="lokasi">Lokasi Kegiatan:</label>
-        <input type="text" id="lokasi" placeholder="Contoh: Aula Lantai 2 / Gedung Merdeka" required>
-    </div>
+        print("\n[INFO] Menunggu halaman siap...")
+        page.wait_for_load_state("networkidle")
+        page.wait_for_timeout(3000)
 
-    <div class="form-group">
-        <label for="foto">Foto Dokumentasi:</label>
-        <input type="file" id="foto" accept="image/*" required>
-    </div>
+        set_rows_per_page_50(page)
 
-    <button onclick="generateReport()">Cetak Laporan (PDF)</button>
-</div>
+        flush_input()
+        input("\n[PETUNJUK RUN v5.0] Pastikan halaman MEMUAT 50 data, lalu tekan ENTER untuk mulai...")
 
-<div id="report-template">
-    <div class="report-header">
-        <h2>LAPORAN DOKUMENTASI KEGIATAN</h2>
-        <p>Sistem Pelaporan Digital Otomatis</p>
-    </div>
+        halaman = 1
+        while halaman <= 5:
+            print(f"\n=========================================")
+            print(f"--- MEMPROSES TUNTAS HALAMAN {halaman} (v5.0) ---")
+            print(f"=========================================")
 
-    <table class="report-details" width="100%">
-        <tr>
-            <td width="25%"><strong>Tanggal Kegiatan</strong></td>
-            <td width="5%">:</td>
-            <td id="view-tanggal"></td>
-        </tr>
-        <tr>
-            <td><strong>Lokasi Kegiatan</strong></td>
-            <td>:</td>
-            <td id="view-lokasi"></td>
-        </tr>
-    </table>
-
-    <h3 style="margin-top: 30px;">Dokumentasi Kegiatan:</h3>
-    <img id="view-foto" class="photo-preview" src="" alt="Foto Dokumentasi">
-</div>
-
-<script>
-    function generateReport() {
-        // 1. Ambil nilai dari input form
-        const tanggal = document.getElementById('tanggal').value;
-        const lokasi = document.getElementById('lokasi').value;
-        const fotoInput = document.getElementById('foto').files[0];
-
-        // Validasi sederhana jika ada data yang kosong
-        if (!tanggal || !lokasi || !fotoInput) {
-            alert("Harap semua data dan foto diisi terlebih dahulu!");
-            return;
-        }
-
-        // 2. Format tanggal agar lebih rapi (opsional)
-        const opsiTanggal = { year: 'numeric', month: 'long', day: 'numeric' };
-        const tanggalDiformat = new Date(tanggal).toLocaleDateString('id-ID', opsiTanggal);
-
-        // 3. Masukkan data ke dalam template laporan
-        document.getElementById('view-tanggal').innerText = tanggalDiformat;
-        document.getElementById('view-lokasi').innerText = lokasi;
-
-        // 4. Membaca file foto dan memasukkannya ke template
-        const reader = new FileReader();
-        reader.onload = function(e) {
-            // Pasang hasil pembacaan gambar ke tag <img> template
-            document.getElementById('view-foto').src = e.target.result;
+            baris_tabel = page.locator(".MuiDataGrid-row, tr:has(button)").all()
+            total_kpm = len(baris_tabel)
             
-            // Tampilkan template sejenak dan panggil dialog print browser
-            document.getElementById('report-template').style.display = 'block';
-            window.print();
-            document.getElementById('report-template').style.display = 'none';
-        }
-        
-        // Menjalankan proses pembacaan foto
-        reader.readAsDataURL(fotoInput);
-    }
-</script>
+            if total_kpm == 0:
+                print("[INFO] Tidak ada baris data terdeteksi. Selesai.")
+                break
+                
+            print(f"[INFO] Terdeteksi kokoh {total_kpm} baris data pada halaman ini.")
 
-</body>
-</html>
+            for i in range(total_kpm):
+                baris_aktif = baris_tabel[i]
+                
+                try:
+                    sel_kolom = baris_aktif.locator(".MuiDataGrid-cell, td").all()
+                    if len(sel_kolom) < 3:
+                        continue
+
+                    # GANTI TOMBOL PEMBUKA POPUP ANGGOTA: gunakan verified_icon
+                    tombol_detail = baris_aktif.locator("button[aria-label='detail']").first
+                    if tombol_detail.count() == 0:
+                        tombol_detail = baris_aktif.locator("button:has(span.material-icons:has-text('verified_icon'))").first
+                    if tombol_detail.count() == 0:
+                        tombol_detail = baris_aktif.locator("button").last
+
+
+                    # --- STRATEGI BACA IDENTITAS PENGURUS (DIPERKETAT v5.0) ---
+                    nik_asli = ambil_data_asli_cell(page, sel_kolom[1])
+                    
+                    # Berikan jeda napas wajib antar-kolom agar clipboard sinkron
+                    page.wait_for_timeout(250)
+                    
+                    kk_asli = ambil_data_asli_cell(page, sel_kolom[3])
+                    
+                    nama_pengurus = ""
+                    for cell in sel_kolom:
+                        txt = cell.inner_text().strip()
+                        if txt and len(txt) > 3 and not any(char.isdigit() for char in txt) and "*" not in txt and "summarize" not in txt:
+                            nama_pengurus = txt
+                            break
+
+                    if not nama_pengurus:
+                        nama_pengurus = sel_kolom[3].inner_text().strip()
+
+                    nama_pengurus = nama_pengurus.replace('\n', ' ').strip()
+
+                    # Buka modal detail anggota keluarga
+                    tombol_detail.click(force=True)
+                    page.wait_for_selector(".MuiDialogContent-root table tbody tr, [role='dialog'] table", timeout=12000)
+                    page.wait_for_timeout(500)
+
+                    # --- PROSES IDENTIFIKASI DINAMIS ANGGOTA KELUARGA v5.0 ---
+                    rows_modal = page.locator(".MuiDialogContent-root table tbody tr, [role='dialog'] tbody tr").all()
+                    
+                    for r in rows_modal:
+                        cols_modal = r.locator("td").all()
+                        if len(cols_modal) >= 2:
+                            
+                            nik_agt = "Tidak Terbaca"
+                            nama_agt = "Tidak Terbaca"
+                            komponen_agt = "-"
+
+                            list_teks_cell = [c.inner_text().strip() for c in cols_modal]
+
+                            # A. Saringan Komponen
+                            keyword_komponen = ['SD', 'SMP', 'SMA', 'HAMIL', 'BALITA', 'LANSIA', 'DISABILITAS', 'KOMPONEN', 'SEKOLAH', 'ANAK', 'APRON']
+                            for txt in list_teks_cell:
+                                if any(key in txt.upper() for key in keyword_komponen):
+                                    komponen_agt = txt
+                                    break
+
+                            # B. Saringan Nama Anggota (hindari nama yang jadi NIK)
+                            for txt in list_teks_cell:
+                                if txt != komponen_agt and "*" not in txt:
+                                    if len(txt) > 2 and not (txt.isdigit() and len(txt) <= 3):
+                                        nama_agt = txt
+                                        break
+
+                            # Fungsi validasi NIK yang diperbarui agar mendukung sensor X / *
+                            def _is_valid_nik(s: str) -> bool:
+                                s = (s or "").strip()
+                                if not s:
+                                    return False
+                                cleaned = s.replace('X', '').replace('x', '').replace('*', '').replace('-', '')
+                                return len(s) >= 10 and (cleaned.isdigit() or cleaned == "")
+
+                            # C. Ambil NIK Anggota (Fokus Perbaikan Kolom)
+                            # C1: Tembak langsung posisi Kolom ke-3 (Index 2) berdasarkan tampilan modal asli
+                            if len(cols_modal) >= 3:
+                                cell_nik_pos = cols_modal[2]
+                                page.wait_for_timeout(150)
+                                coba = ambil_data_asli_cell(page, cell_nik_pos)
+                                if _is_valid_nik(coba):
+                                    nik_agt = coba
+                                else:
+                                    # Fallback jika copy gagal, gunakan text mentah dari layar modal (misal: 3515XXXXXXXX0002)
+                                    nik_agt = cell_nik_pos.inner_text().strip()
+
+                            # C2: Saringan cadangan jika struktur kolom bergeser (melacak cell yang mengandung 'X' atau '*')
+                            if nik_agt == "Tidak Terbaca" or not _is_valid_nik(nik_agt):
+                                for cell in cols_modal:
+                                    txt_c = (cell.inner_text() or "").strip()
+                                    if "X" in txt_c.upper() or "*" in txt_c:
+                                        page.wait_for_timeout(150)
+                                        coba = ambil_data_asli_cell(page, cell)
+                                        if _is_valid_nik(coba):
+                                            nik_agt = coba
+                                            break
+                                        else:
+                                            nik_agt = txt_c
+                                            break
+
+                            # C3: Cadangan pemindaian loop index lama bawaan v5.0 (jika posisi berbeda)
+                            if nik_agt == "Tidak Terbaca":
+                                for nik_idx in [0, 1]:
+                                    if nik_idx < len(cols_modal):
+                                        cell_try = cols_modal[nik_idx]
+                                        page.wait_for_timeout(150)
+                                        coba = ambil_data_asli_cell(page, cell_try)
+                                        if _is_valid_nik(coba):
+                                            nik_agt = coba
+                                            break
+
+                            # C4: Fallback tombol copy 'Salin NIK'
+                            if nik_agt == "Tidak Terbaca":
+                                try:
+                                    btn_nik = r.locator("button[aria-label='Salin NIK']").first
+                                    if btn_nik.count() > 0:
+                                        page.wait_for_timeout(150)
+                                        coba = ambil_data_asli_cell(page, btn_nik)
+                                        if _is_valid_nik(coba):
+                                            nik_agt = coba
+                                except Exception:
+                                    pass
+
+                            # C5: Fallback digit terpanjang jika masih belum lolos saringan
+                            if nik_agt == "Tidak Terbaca":
+                                for cell in cols_modal:
+                                    txt_c = (cell.inner_text() or "").strip()
+                                    if not txt_c or txt_c == nama_agt or txt_c == komponen_agt:
+                                        continue
+                                    if "*" in txt_c or (txt_c.isdigit() and len(txt_c) >= 10):
+                                        page.wait_for_timeout(150)
+                                        coba = ambil_data_asli_cell(page, cell)
+                                        if _is_valid_nik(coba):
+                                            nik_agt = coba
+                                            break
+
+                            list_data_final.append(
+                                {
+                                    'NIK_Pengurus': nik_asli,
+                                    'No_KK_KPM': kk_asli,
+                                    'Nama_Pengurus': nama_pengurus,
+                                    'NIK_Anggota': nik_agt,
+                                    'Nama_Anggota': nama_agt,
+                                    'Kategori_Komponen': komponen_agt,
+                                    'Status': 'SUKSES',
+                                }
+                            )
+
+                    # Tutup Modal Detail
+                    page.keyboard.press("Escape")
+                    page.wait_for_timeout(600)
+                    
+                    print(f"[OK v5.0] Baris {i+1}/{total_kpm} | KPM: {nama_pengurus} | NIK: {nik_asli} | KK: {kk_asli}")
+                    kpm_terproses_count += 1
+
+                    # Save otomatis tiap kelipatan 5 baris KPM
+                    if kpm_terproses_count % 5 == 0:
+                        simpan_ke_excel(list_data_final, nama_file, kolom_baru)
+
+                except Exception as e:
+                    print(f" [GAGAL] Baris {i+1} Halaman {halaman}: {e}")
+                    try:
+                        page.keyboard.press("Escape")
+                    except:
+                        pass
+
+            # --- PINDAH HALAMAN ---
+            next_btn = page.locator("button:has(svg[data-testid='KeyboardArrowRightIcon']), button[aria-label*='Next page' i]").first
+            if next_btn.is_visible() and next_btn.is_enabled():
+                print(f"\n[INFO] Berpindah Halaman ke {halaman + 1}...")
+                next_btn.click()
+                page.wait_for_timeout(4000) 
+                halaman += 1
+            else:
+                print("\n[INFO] Mencapai batas halaman terakhir.")
+                break
+
+        simpan_ke_excel(list_data_final, nama_file, kolom_baru)
+        print(f"\n[PROGRAM SELESAI v5.0] Data sukses tersimpan penuh di {nama_file}")
+        browser.close()
+
+
+if __name__ == "__main__":
+    run()
